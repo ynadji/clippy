@@ -2,3 +2,7 @@
 /dist/
 *.mp4
 *.mkv
+/third_party/src/
+/third_party/build/
+/build/xcframeworks/
+/build/

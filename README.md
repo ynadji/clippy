@@ -129,11 +129,24 @@ or `<Movie>_<start>-<end>.mp4`.
 Bitmap subtitles (PGS, VobSub) cannot be burned in. HDR sources are not tone
 mapped yet, so they will look washed out when re-encoded to 8-bit.
 
+## Engines
+
+`clippy clip` shells out to an ffmpeg binary by default. Built with
+`make build-libav`, it also has a `--engine libav` mode that links FFmpeg's
+libraries directly (via go-astiav) and uses VideoToolbox and AudioToolbox on
+Apple platforms. That engine is what the Banana Clip iOS app embeds; the CLI
+mode exists so it can be tested against a real server on a Mac. See
+`third_party/build-ffmpeg.sh` for the LGPL-only FFmpeg build and
+`docs/LICENSING.md` for why.
+
 ## Layout
 
 - `internal/plex` – a small Plex Media Server and plex.tv client
 - `internal/clip` – ffmpeg command construction and subtitle trimming
-- `internal/proxy` – the localhost block cache ffmpeg reads remote files through
+- `internal/proxy` – the block cache remote files are read through (in-process for libav, over localhost HTTP for the ffmpeg binary)
+- `internal/clip/libav` – the linked-FFmpeg engine (build tag `libav`)
+- `mobile` – the gomobile API the iOS app calls
+- `third_party` – FFmpeg and subtitle-stack build scripts for macOS and iOS
 - `internal/config` – config file handling
 - `main.go` – the CLI
 

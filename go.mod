@@ -1,3 +1,12 @@
 module github.com/ynadji/clippy
 
-go 1.26
+go 1.26.0
+
+require (
+	github.com/asticode/go-astiav v0.43.0 // indirect
+	github.com/asticode/go-astikit v0.42.0 // indirect
+	golang.org/x/mobile v0.0.0-20261011034528-197770444867 // indirect
+	golang.org/x/mod v0.42.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/tools v0.52.0 // indirect
+)

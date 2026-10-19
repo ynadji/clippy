@@ -21,8 +21,10 @@ import (
 	"time"
 )
 
-// Proxy is a single-file caching proxy.
-type Proxy struct {
+// Cache is a block cache over one remote file, usable as an io.ReaderAt.
+// This is what the libav engine reads through in-process; Proxy wraps it in
+// an HTTP server for the ffmpeg binary.
+type Cache struct {
 	upstream  string
 	headers   http.Header
 	client    *http.Client
@@ -36,28 +38,31 @@ type Proxy struct {
 	blocks map[int64][]byte
 	order  []int64 // insertion order, for eviction
 
-	listener net.Listener
-	server   *http.Server
-	token    string
-
 	// Stats
 	Fetches int
 	Bytes   int64
 }
 
-// Option configures a Proxy.
-type Option func(*Proxy)
+// Proxy serves a Cache to ffmpeg over localhost HTTP.
+type Proxy struct {
+	*Cache
+	listener net.Listener
+	server   *http.Server
+	token    string
+}
+
+// Option configures a Cache.
+type Option func(*Cache)
 
 // WithBlockSize sets the fetch granularity (default 4 MiB).
-func WithBlockSize(n int64) Option { return func(p *Proxy) { p.blockSize = n } }
+func WithBlockSize(n int64) Option { return func(p *Cache) { p.blockSize = n } }
 
 // WithMaxBlocks caps the cache (default 128 blocks, 512 MiB at 4 MiB each).
-func WithMaxBlocks(n int) Option { return func(p *Proxy) { p.maxBlocks = n } }
+func WithMaxBlocks(n int) Option { return func(p *Cache) { p.maxBlocks = n } }
 
-// Start probes the upstream file for its size and begins serving it on a
-// random localhost port. Call Close when done.
-func Start(ctx context.Context, upstream string, headers http.Header, opts ...Option) (*Proxy, error) {
-	p := &Proxy{
+// NewCache probes the upstream file for its size and returns a cache over it.
+func NewCache(ctx context.Context, upstream string, headers http.Header, opts ...Option) (*Cache, error) {
+	p := &Cache{
 		upstream:  upstream,
 		headers:   headers,
 		client:    &http.Client{Timeout: 5 * time.Minute},
@@ -68,19 +73,35 @@ func Start(ctx context.Context, upstream string, headers http.Header, opts ...Op
 	for _, o := range opts {
 		o(p)
 	}
-	tok := make([]byte, 8)
-	_, _ = rand.Read(tok)
-	p.token = hex.EncodeToString(tok)
 	p.name = path.Base(strings.SplitN(upstream, "?", 2)[0])
 	if p.name == "" || p.name == "." || p.name == "/" {
 		p.name = "media"
 	}
-
 	size, err := p.probeSize(ctx)
 	if err != nil {
 		return nil, err
 	}
 	p.size = size
+	return p, nil
+}
+
+// Name is the file's base name, useful for format probing.
+func (p *Cache) Name() string { return p.name }
+
+// Size is the upstream file size.
+func (p *Cache) Size() int64 { return p.size }
+
+// Start probes the upstream file for its size and begins serving it on a
+// random localhost port. Call Close when done.
+func Start(ctx context.Context, upstream string, headers http.Header, opts ...Option) (*Proxy, error) {
+	c, err := NewCache(ctx, upstream, headers, opts...)
+	if err != nil {
+		return nil, err
+	}
+	p := &Proxy{Cache: c}
+	tok := make([]byte, 8)
+	_, _ = rand.Read(tok)
+	p.token = hex.EncodeToString(tok)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -97,9 +118,6 @@ func (p *Proxy) URL() string {
 	return fmt.Sprintf("http://%s/%s/%s", p.listener.Addr(), p.token, p.name)
 }
 
-// Size is the upstream file size.
-func (p *Proxy) Size() int64 { return p.size }
-
 // Close stops the server.
 func (p *Proxy) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -107,7 +125,7 @@ func (p *Proxy) Close() error {
 	return p.server.Shutdown(ctx)
 }
 
-func (p *Proxy) newRequest(ctx context.Context, from, to int64) (*http.Request, error) {
+func (p *Cache) newRequest(ctx context.Context, from, to int64) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.upstream, nil)
 	if err != nil {
 		return nil, err
@@ -120,7 +138,7 @@ func (p *Proxy) newRequest(ctx context.Context, from, to int64) (*http.Request, 
 }
 
 // probeSize asks for the first byte and reads the total from Content-Range.
-func (p *Proxy) probeSize(ctx context.Context) (int64, error) {
+func (p *Cache) probeSize(ctx context.Context) (int64, error) {
 	req, err := p.newRequest(ctx, 0, 0)
 	if err != nil {
 		return 0, err
@@ -157,7 +175,7 @@ func (p *Proxy) probeSize(ctx context.Context) (int64, error) {
 
 // block returns the cached block starting at off, fetching it if needed.
 // Called with p.mu held.
-func (p *Proxy) block(ctx context.Context, off int64) ([]byte, error) {
+func (p *Cache) block(ctx context.Context, off int64) ([]byte, error) {
 	if b, ok := p.blocks[off]; ok {
 		return b, nil
 	}
@@ -193,7 +211,7 @@ func (p *Proxy) block(ctx context.Context, off int64) ([]byte, error) {
 }
 
 // ReadAt implements io.ReaderAt over the block cache.
-func (p *Proxy) ReadAt(buf []byte, off int64) (int, error) {
+func (p *Cache) ReadAt(buf []byte, off int64) (int, error) {
 	if off >= p.size {
 		return 0, io.EOF
 	}

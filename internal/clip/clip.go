@@ -272,6 +272,52 @@ func Shell(cmd []string) string {
 	return strings.Join(parts, " ")
 }
 
+// Progress reports how far a clip has got, in output seconds, as a fraction
+// of the requested duration.
+type Progress func(done, total time.Duration)
+
+// Engine produces a clip from a Request. ExecEngine shells out to an
+// ffmpeg binary; the libav engine (build tag "libav") links FFmpeg's
+// libraries directly and is what the iOS app uses.
+type Engine interface {
+	// Name identifies the engine in logs and dry runs.
+	Name() string
+	// Preflight checks that the engine can carry out the request.
+	Preflight(r *Request) error
+	// Describe returns a human-readable summary of what Run would do.
+	Describe(r *Request) ([]string, error)
+	// Run produces r.Output.
+	Run(ctx context.Context, r *Request, log io.Writer, progress Progress) error
+}
+
+// ExecEngine runs an external ffmpeg binary.
+type ExecEngine struct{}
+
+func (ExecEngine) Name() string { return "ffmpeg (exec)" }
+
+func (ExecEngine) Preflight(r *Request) error { return r.Preflight() }
+
+func (ExecEngine) Describe(r *Request) ([]string, error) {
+	p, err := r.Build()
+	if err != nil {
+		return nil, err
+	}
+	defer p.Cleanup()
+	var out []string
+	for _, s := range p.Steps {
+		out = append(out, s.String())
+	}
+	return out, nil
+}
+
+func (ExecEngine) Run(ctx context.Context, r *Request, log io.Writer, progress Progress) error {
+	p, err := r.Build()
+	if err != nil {
+		return err
+	}
+	return p.Run(ctx, log)
+}
+
 // Run executes the plan, streaming ffmpeg's progress to stderr.
 func (p *Plan) Run(ctx context.Context, stderr io.Writer) error {
 	if p.TempDir != "" {

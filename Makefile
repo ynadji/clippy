@@ -23,3 +23,14 @@ dist:
 
 clean:
 	rm -rf bin dist
+
+# CLI with the linked-FFmpeg engine (needs third_party/build-ffmpeg.sh macos).
+FFPC = $(CURDIR)/third_party/build/macos/lib/pkgconfig
+build-libav:
+	PKG_CONFIG_PATH=$(FFPC) go build $(GOFLAGS) -tags libav -o bin/clippy-libav .
+
+test-libav:
+	PKG_CONFIG_PATH=$(FFPC) go test -tags libav ./...
+
+ffmpeg-macos:
+	third_party/build-ffmpeg.sh macos

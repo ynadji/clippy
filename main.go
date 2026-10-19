@@ -273,7 +273,7 @@ type clipFlags struct {
 	remote, direct                     bool
 	subStream, audioStream             int
 	maxHeight, crf                     int
-	preset, hwaccel                    string
+	preset, hwaccel, engine            string
 }
 
 func cmdClip(ctx context.Context, args []string) error {
@@ -303,6 +303,7 @@ func cmdClip(ctx context.Context, args []string) error {
 	fs.StringVar(&f.hwaccel, "hwaccel", "auto", "hardware decoder: auto, none, videotoolbox, cuda, vaapi, ...")
 	fs.BoolVar(&f.remote, "remote", false, "stream from the server even if a path_map entry matches")
 	fs.BoolVar(&f.direct, "direct", false, "let ffmpeg read from the server directly instead of through the local block cache")
+	fs.StringVar(&f.engine, "engine", "exec", "clip engine: exec (ffmpeg binary) or libav (linked FFmpeg libraries, if built in)")
 	fs.BoolVar(&f.dryRun, "dry-run", false, "print the ffmpeg command instead of running it")
 	fs.Parse(args)
 
@@ -371,7 +372,8 @@ func cmdClip(ctx context.Context, args []string) error {
 		req.Output = filepath.Join(cfg.OutputDir, name)
 	}
 
-	if err := req.Preflight(); err != nil && !f.dryRun {
+	engine := selectEngine(f.engine)
+	if err := engine.Preflight(&req); err != nil && !f.dryRun {
 		return err
 	}
 	// ffmpeg seeks relentlessly in some containers, and each seek against a
@@ -386,14 +388,14 @@ func cmdClip(ctx context.Context, args []string) error {
 		defer px.Close()
 		req.Input, req.Headers = px.URL(), ""
 	}
-	plan, err := req.Build()
-	if err != nil {
-		return err
-	}
 	fmt.Fprintf(os.Stderr, "%s  %s → %s (%s)\n", item.Label(), clip.Clock(start), clip.Clock(start+dur), dur.Round(100*time.Millisecond))
 	if f.dryRun {
-		plan.Cleanup()
-		for _, s := range plan.Steps {
+		steps, err := engine.Describe(&req)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("# engine: %s\n", engine.Name())
+		for _, s := range steps {
 			fmt.Println(s)
 		}
 		return nil
@@ -404,7 +406,7 @@ func cmdClip(ctx context.Context, args []string) error {
 		}
 	}
 	t0 := time.Now()
-	if err := plan.Run(ctx, os.Stderr); err != nil {
+	if err := engine.Run(ctx, &req, os.Stderr, nil); err != nil {
 		return err
 	}
 	fmt.Fprintln(os.Stderr)
