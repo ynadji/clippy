@@ -190,57 +190,54 @@ func sessionFrom(ctx context.Context, cl *plex.Client, it *plex.Item) *Session {
 	}
 	pos, via := cl.LivePosition(ctx, it)
 	s.PositionMs, s.PositionVia = pos.Milliseconds(), via
-	if p := it.SelectedPart(); p != nil {
-		s.PartKey, s.FileName = p.Key, p.File
-		// A session lists only some streams, may describe a transcode rather
-		// than the file, and some players (Plex for iOS) do not mark the
-		// subtitle selection there. The library metadata describes the file
-		// itself, with every track and the account's selection.
-		var fullPart *plex.Part
-		media := it.MediaFor(p)
-		if it.Player != nil {
-			if full, err := cl.Metadata(ctx, it.RatingKey); err == nil {
-				if fp := partByKey(full, p.Key); fp != nil {
-					fullPart = fp
-					if fm := full.MediaFor(fp); fm != nil {
-						media = fm
-					}
-				}
-			}
+	// Sessions describe what the player is getting, which for a transcode
+	// is not the file. The library record describes the file, with every
+	// track and the account's selection; FilePart fetches it when needed.
+	sp := it.SelectedPart()
+	fp, full, err := cl.FilePart(ctx, it)
+	if err != nil || fp == nil {
+		return s
+	}
+	s.PartKey, s.FileName = fp.Key, fp.File
+	if media := full.MediaFor(fp); media != nil {
+		s.VideoCodec = media.VideoCodec
+		s.VideoWidth, s.VideoHeight = int(media.Width), int(media.Height)
+		s.VideoClass = clip.ResolutionClass(s.VideoWidth, s.VideoHeight)
+		if s.VideoClass == 0 {
+			s.VideoClass = classFromLabel(media.VideoResolution)
 		}
-		if media != nil {
-			s.VideoCodec = media.VideoCodec
-			s.VideoWidth, s.VideoHeight = int(media.Width), int(media.Height)
-			s.VideoClass = clip.ResolutionClass(s.VideoWidth, s.VideoHeight)
-			if s.VideoClass == 0 {
-				s.VideoClass = classFromLabel(media.VideoResolution)
-			}
+	}
+	// The audio track being played: the session's choice, mapped onto the
+	// file's streams by id, else the account's selection in the library.
+	var a *plex.Stream
+	if sp != nil {
+		a = plex.FileStream(sp.ActiveStream(plex.StreamAudio), fp)
+	}
+	if a == nil {
+		a = fp.SelectedStream(plex.StreamAudio)
+	}
+	if a != nil {
+		s.AudioIndex = int(a.Index)
+		s.AudioLang = a.LanguageCode
+	}
+	// Subtitles: every track of the file; the player's choice wins over the
+	// account's when it reports one.
+	var playerSub *plex.Stream
+	if sp != nil {
+		playerSub = plex.FileStream(sp.SelectedStream(plex.StreamSubtitle), fp)
+	}
+	for i := range fp.Streams(plex.StreamSubtitle) {
+		st := fp.Streams(plex.StreamSubtitle)[i]
+		sub := subtitleFrom(&st)
+		if playerSub != nil {
+			sub.Selected = st.ID == playerSub.ID
 		}
-		// The audio track being played: what the session says, else the
-		// account's selection in the library.
-		a := p.ActiveStream(plex.StreamAudio)
-		if a == nil && fullPart != nil {
-			a = fullPart.SelectedStream(plex.StreamAudio)
+		if sub.Selected && !sub.External {
+			s.SubIndex, s.SubCodec, s.SubExternal = sub.Index, sub.Codec, false
+		} else if sub.Selected {
+			s.SubIndex, s.SubCodec, s.SubExternal = -1, sub.Codec, true
 		}
-		if a != nil {
-			s.AudioIndex = int(a.Index)
-			s.AudioLang = a.LanguageCode
-		}
-		if sub := p.SelectedStream(plex.StreamSubtitle); sub != nil {
-			s.SubIndex, s.SubCodec, s.SubExternal = int(sub.Index), sub.Codec, sub.Key != ""
-		}
-		streams := p.Streams(plex.StreamSubtitle)
-		if fullPart != nil {
-			streams = fullPart.Streams(plex.StreamSubtitle)
-		}
-		sessionSelected := s.SubIndex
-		for i := range streams {
-			sub := subtitleFrom(&streams[i])
-			if sessionSelected >= 0 && !sub.External {
-				sub.Selected = sub.Index == sessionSelected // the player's choice wins when it reports one
-			}
-			s.subs = append(s.subs, sub)
-		}
+		s.subs = append(s.subs, sub)
 	}
 	return s
 }
@@ -257,18 +254,6 @@ func classFromLabel(label string) int {
 		return n
 	}
 	return 0
-}
-
-// partByKey finds the part with the given key, or the selected part.
-func partByKey(it *plex.Item, key string) *plex.Part {
-	for i := range it.Media {
-		for j := range it.Media[i].Part {
-			if it.Media[i].Part[j].Key == key {
-				return &it.Media[i].Part[j]
-			}
-		}
-	}
-	return it.SelectedPart()
 }
 
 // NowPlaying lists the video sessions on the server with live positions.

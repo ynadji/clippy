@@ -113,6 +113,59 @@ func (c *Client) Download(ctx context.Context, path, dest string) error {
 	return err
 }
 
+// FilePart returns the part that describes the file behind a session item.
+// A session that is being transcoded describes the transcode, not the file,
+// so the library record is fetched and matched by part id. The returned
+// item is the one the part belongs to.
+func (c *Client) FilePart(ctx context.Context, it *Item) (*Part, *Item, error) {
+	p := it.SelectedPart()
+	if p == nil {
+		return nil, nil, fmt.Errorf("plex: %s has no media", it.Label())
+	}
+	if !p.IsTranscode() && it.Player == nil {
+		return p, it, nil
+	}
+	full, err := c.Metadata(ctx, it.RatingKey)
+	if err != nil {
+		if !p.IsTranscode() {
+			return p, it, nil // the session's own part will do
+		}
+		return nil, nil, err
+	}
+	fp := full.PartByID(p.ID)
+	if fp == nil {
+		for i := range full.Media {
+			for j := range full.Media[i].Part {
+				if full.Media[i].Part[j].Key == p.Key && p.Key != "" {
+					fp = &full.Media[i].Part[j]
+				}
+			}
+		}
+	}
+	if fp == nil {
+		fp = full.SelectedPart()
+	}
+	if fp == nil || fp.Key == "" {
+		return nil, nil, fmt.Errorf("plex: %s has no media file on the server", it.Label())
+	}
+	return fp, full, nil
+}
+
+// FileStream maps a stream of a session part onto the file's part by id, so
+// that a transcoding session's selection resolves to a real stream index.
+// Falls back to the stream itself when it is not in the file's part.
+func FileStream(s *Stream, filePart *Part) *Stream {
+	if s == nil {
+		return nil
+	}
+	if filePart != nil {
+		if fs := filePart.StreamByID(s.ID); fs != nil {
+			return fs
+		}
+	}
+	return s
+}
+
 // PartURL returns the URL from which ffmpeg can read the part's original file.
 func (c *Client) PartURL(p *Part) string { return c.URL + p.Key }
 

@@ -320,10 +320,12 @@ func cmdClip(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	part := item.SelectedPart()
-	if part == nil || part.Key == "" {
-		return fmt.Errorf("%s has no media file on the server", item.Label())
+	sessionPart := item.SelectedPart()
+	part, fileItem, err := cl.FilePart(ctx, item)
+	if err != nil {
+		return err
 	}
+	item = fileItem
 	if f.listStream {
 		printStreams(item, part)
 		return nil
@@ -355,7 +357,9 @@ func cmdClip(ctx context.Context, args []string) error {
 	}
 	if f.audioStream >= 0 {
 		req.AudioIndex = f.audioStream
-	} else if s := part.ActiveStream(plex.StreamAudio); s != nil && s.Index >= 0 {
+	} else if s := plex.FileStream(sessionPart.ActiveStream(plex.StreamAudio), part); s != nil && s.Index >= 0 {
+		req.AudioIndex = int(s.Index)
+	} else if s := part.SelectedStream(plex.StreamAudio); s != nil {
 		req.AudioIndex = int(s.Index)
 	}
 	if f.subs || f.subStream >= 0 {

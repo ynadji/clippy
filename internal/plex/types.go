@@ -200,6 +200,39 @@ func (p *Part) SelectedStream(typ int) *Stream {
 	return nil
 }
 
+// PartByID finds the part with the given Plex part id.
+func (it *Item) PartByID(id Int) *Part {
+	if id == 0 {
+		return nil
+	}
+	for i := range it.Media {
+		for j := range it.Media[i].Part {
+			if it.Media[i].Part[j].ID == id {
+				return &it.Media[i].Part[j]
+			}
+		}
+	}
+	return nil
+}
+
+// StreamByID finds the stream with the given Plex stream id.
+func (p *Part) StreamByID(id Int) *Stream {
+	if id == 0 {
+		return nil
+	}
+	for i := range p.Stream {
+		if p.Stream[i].ID == id {
+			return &p.Stream[i]
+		}
+	}
+	return nil
+}
+
+// IsTranscode reports whether a session part describes what the server is
+// sending a player rather than the file: no key, and streams without index
+// numbers. Such a part's streams still carry the ids of the file's streams.
+func (p *Part) IsTranscode() bool { return p.Key == "" }
+
 // ActiveStream returns the stream of the given type that is in use: the one
 // marked selected, or failing that the only one listed. Sessions from some
 // players (Plex for iOS) list just the audio track being played, without

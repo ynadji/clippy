@@ -54,3 +54,31 @@ func TestActiveStream(t *testing.T) {
 		t.Errorf("ambiguous streams should give nil, got %+v", a)
 	}
 }
+
+func TestTranscodeSessionLookups(t *testing.T) {
+	// A transcoding session: the part has no key and its streams no index,
+	// but their ids match the file's streams.
+	session := Part{ID: 157556, Stream: []Stream{
+		{ID: 313987, StreamType: 1, Codec: "h264"},
+		{ID: 313988, StreamType: 2, Codec: "aac", Selected: true, LanguageCode: "zho"},
+	}}
+	if !session.IsTranscode() {
+		t.Error("a keyless part should count as a transcode")
+	}
+	file := Item{Media: []Media{{Part: []Part{{ID: 157556, Key: "/library/parts/157556/1/file.mkv", Stream: []Stream{
+		{ID: 313987, StreamType: 1, Index: 0, Codec: "h264"},
+		{ID: 313988, StreamType: 2, Index: 1, Codec: "flac", LanguageCode: "zho"},
+		{ID: 313989, StreamType: 2, Index: 3, Codec: "flac", LanguageCode: "eng"},
+	}}}}}}
+	fp := file.PartByID(157556)
+	if fp == nil || fp.Key == "" {
+		t.Fatal("part not found by id")
+	}
+	a := FileStream(session.ActiveStream(StreamAudio), fp)
+	if a == nil || a.Index != 1 || a.Codec != "flac" {
+		t.Errorf("session audio should map to the file's stream 1 (flac), got %+v", a)
+	}
+	if s := FileStream(&Stream{ID: 999}, fp); s == nil || s.ID != 999 {
+		t.Error("an unknown stream should fall back to itself")
+	}
+}
