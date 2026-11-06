@@ -21,14 +21,25 @@ Obligations the app carries:
 1. Attribution: the Licenses screen in Settings names FFmpeg and the LGPL
    and the other libraries.
 2. Source offer: publish the exact FFmpeg and dependency sources plus the
-   build scripts (`third_party/`) so anyone can rebuild the libraries.
+   build scripts (`third_party/`) so anyone can rebuild the libraries. The
+   versions are pinned in those scripts (FFmpeg 9.0.2, FriBidi 1.0.16, libass
+   0.17.4, FreeType 2.13.3, HarfBuzz 11.2.1), all unmodified upstream
+   releases. This repository must be publicly readable for the offer to hold.
 3. Relinking: LGPL 2.1 §6 requires that users can relink the app against a
-   modified library. The libraries are currently linked statically for
-   simplicity while the app is in development. Before shipping, package
-   FFmpeg as embedded dynamic frameworks (what FFmpegKit did for its LGPL
-   builds) so the obligation is met in the conventional way. The Go core is
-   a static archive and links against those frameworks; nothing else
-   changes.
+   modified library. FFmpeg and FriBidi, the two LGPL components, are built
+   as shared libraries and embedded in the app as dynamic frameworks
+   (`third_party/make-xcframeworks.sh`): separate, individually signed
+   binaries in the bundle's Frameworks folder, loaded at launch, not linked
+   into the app's executable. The Go core is a static archive that calls into
+   them. Anyone can rebuild the frameworks from the published scripts and
+   substitute them. libass, FreeType and HarfBuzz are permissively licensed
+   and are linked statically into libavfilter.
+
+   App Store code signing means a substituted framework will not load on a
+   stock device without re-signing the app. That limitation applies to every
+   iOS app using LGPL code; dynamic linking plus a source offer is the
+   accepted good-faith way to meet the obligation, and what FFmpegKit's LGPL
+   builds did.
 4. Do not modify FFmpeg itself. If a patch becomes necessary, publish it
    alongside the sources.
 

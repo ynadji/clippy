@@ -9,6 +9,9 @@
 #
 # Outputs to third_party/build/<target>/{lib,include}. Network I/O is done by
 # Go through a custom AVIO callback, so no HTTP/TLS is compiled in.
+#
+# Every target builds shared libraries. On iOS they are packaged as dynamic
+# frameworks by make-xcframeworks.sh; see docs/LICENSING.md for why.
 set -euo pipefail
 
 TARGET="${1:-macos}"
@@ -68,9 +71,14 @@ case "$TARGET" in
       --enable-cross-compile --target-os=darwin --arch=arm64
       --cc="$(xcrun --sdk $SDK -f clang)" --as="$(xcrun --sdk $SDK -f clang)"
       --sysroot="$SYSROOT"
-      --extra-cflags="-arch arm64 $MINVER -fembed-bitcode-marker"
-      --extra-ldflags="-arch arm64 $MINVER" --extra-libs=-liconv
-      --enable-static --disable-shared
+      --extra-cflags="-arch arm64 $MINVER"
+      --extra-ldflags="-arch arm64 $MINVER"
+      # libass and HarfBuzz are linked statically into libavfilter; HarfBuzz
+      # is C++ and uses CoreGraphics through its CoreText backend.
+      --extra-libs="-liconv -lc++ -framework CoreGraphics"
+      # Shared, so the app embeds FFmpeg as replaceable dynamic frameworks
+      # (LGPL). make-xcframeworks.sh rewrites these @rpath names per framework.
+      --enable-shared --disable-static --install-name-dir=@rpath
       --disable-asm
       --pkg-config="$(command -v pkg-config)"
     )

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Cross-compiles the subtitle rendering stack (fribidi, freetype, harfbuzz,
-# libass) as static libraries for iOS. All permissively licensed or LGPL.
+# libass) for iOS. FriBidi is LGPL, so it is built as a shared library and
+# shipped as its own dynamic framework. FreeType, HarfBuzz and libass are
+# permissively licensed and are built static; they end up inside libavfilter.
 #
 #   third_party/build-deps.sh ios            # arm64 device
 #   third_party/build-deps.sh iossimulator   # arm64 simulator
@@ -37,8 +39,11 @@ mkdir -p "$DEPS"
 
 echo "== fribidi ($TARGET)"
 ( cd "$SRC/fribidi-1.0.16" && make distclean >/dev/null 2>&1 || true
-  cd "$SRC/fribidi-1.0.16" && ./configure --host=$HOST --prefix="$DEPS" --enable-static --disable-shared --disable-docs >/dev/null
+  cd "$SRC/fribidi-1.0.16" && ./configure --host=$HOST --prefix="$DEPS" --enable-shared --disable-static --disable-docs >/dev/null
   make -j"$JOBS" >/dev/null && make install >/dev/null )
+# Give it the name it will have as an embedded framework, so that everything
+# linked against it from here on records that name.
+install_name_tool -id "@rpath/libfribidi.framework/libfribidi" "$(cd "$DEPS/lib" && pwd -P)/$(readlink "$DEPS/lib/libfribidi.dylib")" 2>/dev/null
 
 echo "== freetype ($TARGET)"
 ( cd "$SRC/freetype-2.13.3" && make distclean >/dev/null 2>&1 || true
@@ -68,4 +73,4 @@ echo "== libass ($TARGET)"
   make -j"$JOBS" >/dev/null && make install >/dev/null )
 
 echo "deps installed to $DEPS:"
-ls "$DEPS/lib"/*.a
+ls "$DEPS/lib"/*.a "$DEPS/lib"/*.dylib
