@@ -194,7 +194,10 @@ func (r *Request) Build() (*Plan, error) {
 	} else {
 		var filters []string
 		if r.MaxHeight > 0 {
-			filters = append(filters, fmt.Sprintf("scale=-2:'min(%d,ih)'", r.MaxHeight))
+			// Fit within the 16:9 frame of that height, never upscaling.
+			filters = append(filters, fmt.Sprintf(
+				"scale=w='min(iw,%d)':h='min(ih,%d)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+				r.MaxHeight*16/9, r.MaxHeight))
 		}
 		if subFile != "" {
 			filters = append(filters, "subtitles="+filterEscape(subFile))

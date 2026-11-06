@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -118,6 +119,9 @@ type Session struct {
 	PartKey     string // path on the server that serves the file
 	FileName    string
 	VideoCodec  string
+	VideoWidth  int // source picture size, 0 if unknown
+	VideoHeight int
+	VideoClass  int // resolution tier of the source: 480, 720, 1080, 2160, ...; 0 if unknown
 	AudioIndex  int // selected audio stream (absolute index), -1 if unknown
 	SubIndex    int // selected subtitle stream (absolute index), -1 if none
 	SubCodec    string
@@ -188,8 +192,29 @@ func sessionFrom(ctx context.Context, cl *plex.Client, it *plex.Item) *Session {
 	s.PositionMs, s.PositionVia = pos.Milliseconds(), via
 	if p := it.SelectedPart(); p != nil {
 		s.PartKey, s.FileName = p.Key, p.File
-		if m := it.MediaFor(p); m != nil {
-			s.VideoCodec = m.VideoCodec
+		// A session lists only some streams, may describe a transcode rather
+		// than the file, and some players (Plex for iOS) do not mark the
+		// subtitle selection there. The library metadata describes the file
+		// itself, with every track and the account's selection.
+		var fullPart *plex.Part
+		media := it.MediaFor(p)
+		if it.Player != nil {
+			if full, err := cl.Metadata(ctx, it.RatingKey); err == nil {
+				if fp := partByKey(full, p.Key); fp != nil {
+					fullPart = fp
+					if fm := full.MediaFor(fp); fm != nil {
+						media = fm
+					}
+				}
+			}
+		}
+		if media != nil {
+			s.VideoCodec = media.VideoCodec
+			s.VideoWidth, s.VideoHeight = int(media.Width), int(media.Height)
+			s.VideoClass = clip.ResolutionClass(s.VideoWidth, s.VideoHeight)
+			if s.VideoClass == 0 {
+				s.VideoClass = classFromLabel(media.VideoResolution)
+			}
 		}
 		if a := p.SelectedStream(plex.StreamAudio); a != nil {
 			s.AudioIndex = int(a.Index)
@@ -199,15 +224,8 @@ func sessionFrom(ctx context.Context, cl *plex.Client, it *plex.Item) *Session {
 			s.SubIndex, s.SubCodec, s.SubExternal = int(sub.Index), sub.Codec, sub.Key != ""
 		}
 		streams := p.Streams(plex.StreamSubtitle)
-		// A session lists only some streams and some players (Plex for iOS)
-		// do not mark the subtitle selection there. The library metadata has
-		// every track, with the account's selection.
-		if it.Player != nil {
-			if full, err := cl.Metadata(ctx, it.RatingKey); err == nil {
-				if fp := partByKey(full, p.Key); fp != nil {
-					streams = fp.Streams(plex.StreamSubtitle)
-				}
-			}
+		if fullPart != nil {
+			streams = fullPart.Streams(plex.StreamSubtitle)
 		}
 		sessionSelected := s.SubIndex
 		for i := range streams {
@@ -219,6 +237,20 @@ func sessionFrom(ctx context.Context, cl *plex.Client, it *plex.Item) *Session {
 		}
 	}
 	return s
+}
+
+// classFromLabel maps Plex's videoResolution label to a tier.
+func classFromLabel(label string) int {
+	switch strings.ToLower(label) {
+	case "4k":
+		return 2160
+	case "sd":
+		return 480
+	}
+	if n, err := strconv.Atoi(strings.TrimSuffix(strings.ToLower(label), "p")); err == nil {
+		return n
+	}
+	return 0
 }
 
 // partByKey finds the part with the given key, or the selected part.

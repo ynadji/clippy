@@ -49,9 +49,13 @@ type Media struct {
 	ID         Int    `json:"id"`
 	VideoCodec string `json:"videoCodec"`
 	AudioCodec string `json:"audioCodec"`
-	Container  string `json:"container"`
-	Selected   Bool   `json:"selected"`
-	Part       []Part `json:"Part"`
+	Width      Int    `json:"width"`
+	Height     Int    `json:"height"`
+	// VideoResolution is Plex's own label: "480", "720", "1080", "4k", "sd".
+	VideoResolution string `json:"videoResolution"`
+	Container       string `json:"container"`
+	Selected        Bool   `json:"selected"`
+	Part            []Part `json:"Part"`
 }
 
 // Part is one file of a Media.

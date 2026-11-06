@@ -557,14 +557,8 @@ func setPrivateOptions(cc *astiav.CodecContext, opts map[string]string) {
 	}
 }
 
-// outputSize applies the max-height cap, keeping even dimensions.
-func outputSize(w, h, maxHeight int) (int, int) {
-	if maxHeight > 0 && h > maxHeight {
-		w = int(float64(w)*float64(maxHeight)/float64(h) + 0.5)
-		h = maxHeight
-	}
-	return w &^ 1, h &^ 1
-}
+// outputSize fits the picture within the 16:9 frame of the given height.
+func outputSize(w, h, maxHeight int) (int, int) { return clip.FitWithin(w, h, maxHeight) }
 
 func videoBitrate(h int) int64 {
 	switch {
