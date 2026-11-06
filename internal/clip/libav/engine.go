@@ -244,9 +244,20 @@ func (s *source) close() {
 }
 
 // seekTo positions the demuxer at the last keyframe before t.
+//
+// It always seeks by the video stream when there is one. Left to choose, the
+// demuxer picks among the streams that are not discarded, and during the
+// subtitle pass that is only the subtitle stream, which in many files has no
+// seek index: the seek then fails outright.
 func (s *source) seekTo(t time.Duration) error {
+	flags := astiav.NewSeekFlags(astiav.SeekFlagBackward)
+	if vs, _, err := s.fc.FindBestStream(astiav.MediaTypeVideo, -1, -1); err == nil && vs != nil {
+		if err := s.fc.SeekFrame(vs.Index(), tb(t, vs.TimeBase()), flags); err == nil {
+			return nil
+		}
+	}
 	ts := int64(t / time.Microsecond) // AV_TIME_BASE is microseconds
-	return s.fc.SeekFrame(-1, ts, astiav.NewSeekFlags(astiav.SeekFlagBackward))
+	return s.fc.SeekFrame(-1, ts, flags)
 }
 
 // tb converts a duration into a stream's time base.
@@ -1101,16 +1112,16 @@ func extractSubtitles(ctx context.Context, src *source, r *clip.Request, dir str
 		return "", fmt.Errorf("libav: subtitle header: %w", err)
 	}
 
+	if in == src {
+		if err := src.seekTo(r.Start); err != nil {
+			return "", fmt.Errorf("libav: seek for subtitles: %w", err)
+		}
+	}
 	for _, s := range in.fc.Streams() {
 		if s.Index() == st.Index() {
 			s.SetDiscard(astiav.DiscardDefault)
 		} else {
 			s.SetDiscard(astiav.DiscardAll)
-		}
-	}
-	if in == src {
-		if err := src.seekTo(r.Start); err != nil {
-			return "", err
 		}
 	}
 	start, end := tb(r.Start, st.TimeBase()), tb(r.Start+r.Duration, st.TimeBase())
