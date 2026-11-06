@@ -85,6 +85,13 @@ func NewCache(ctx context.Context, upstream string, headers http.Header, opts ..
 	return p, nil
 }
 
+// Stats returns how many upstream requests were made and bytes fetched.
+func (p *Cache) Stats() (fetches int, bytes int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.Fetches, p.Bytes
+}
+
 // Name is the file's base name, useful for format probing.
 func (p *Cache) Name() string { return p.name }
 

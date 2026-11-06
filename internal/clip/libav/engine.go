@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/asticode/go-astiav"
@@ -136,6 +137,41 @@ func parseHeaders(raw string) http.Header {
 	return h
 }
 
+// cachePool keeps the block cache of the most recently used remote file so
+// that consecutive calls on it (two thumbnails per scrub in the app, then
+// the clip itself) reuse the blocks already fetched instead of each opening
+// their own cache. A Cache is safe for concurrent readers.
+var cachePool struct {
+	mu    sync.Mutex
+	key   string
+	cache *proxy.Cache
+}
+
+// maxCacheBlocks bounds memory per file: 48 blocks of 4 MiB is 192 MiB.
+const maxCacheBlocks = 48
+
+func sharedCache(ctx context.Context, input, headers string) (*proxy.Cache, error) {
+	key := input + "\x00" + headers
+	cachePool.mu.Lock()
+	if cachePool.key == key && cachePool.cache != nil {
+		c := cachePool.cache
+		cachePool.mu.Unlock()
+		return c, nil
+	}
+	cachePool.mu.Unlock()
+	c, err := proxy.NewCache(ctx, input, parseHeaders(headers), proxy.WithMaxBlocks(maxCacheBlocks))
+	if err != nil {
+		return nil, err
+	}
+	cachePool.mu.Lock()
+	defer cachePool.mu.Unlock()
+	if cachePool.key == key && cachePool.cache != nil { // lost a race; use the winner
+		return cachePool.cache, nil
+	}
+	cachePool.key, cachePool.cache = key, c
+	return c, nil
+}
+
 func openSource(ctx context.Context, input, headers string) (*source, error) {
 	s := &source{fc: astiav.AllocFormatContext()}
 	if s.fc == nil {
@@ -143,7 +179,7 @@ func openSource(ctx context.Context, input, headers string) (*source, error) {
 	}
 	var err error
 	if isURL(input) {
-		if s.cache, err = proxy.NewCache(ctx, input, parseHeaders(headers)); err != nil {
+		if s.cache, err = sharedCache(ctx, input, headers); err != nil {
 			s.fc.Free()
 			return nil, err
 		}
@@ -804,6 +840,8 @@ func (Engine) Run(ctx context.Context, r *clip.Request, logw io.Writer, progress
 
 	// Audio: trim precisely, convert to the encoder's format, then feed the
 	// encoder fixed-size frames through a FIFO.
+	debug := os.Getenv("CLIPPY_LIBAV_DEBUG") != "" && logw != nil
+	nAudioIn, nAudioOut := 0, 0
 	var fifo *astiav.AudioFifo
 	var aframe *astiav.Frame
 	var samplesOut int64
@@ -845,6 +883,10 @@ func (Engine) Run(ctx context.Context, r *clip.Request, logw io.Writer, progress
 		return nil
 	}
 	onAudioOut := func(f *astiav.Frame) error {
+		nAudioOut++
+		if debug && nAudioOut <= 6 {
+			fmt.Fprintf(logw, "audio out #%d: pts=%d rate=%d samples=%d\n", nAudioOut, f.Pts(), f.SampleRate(), f.NbSamples())
+		}
 		if fifo == nil {
 			fifo = astiav.AllocAudioFifo(aenc.cc.SampleFormat(), aenc.cc.ChannelLayout().Channels(), 8192)
 			aframe = astiav.AllocFrame()
@@ -854,11 +896,36 @@ func (Engine) Run(ctx context.Context, r *clip.Request, logw io.Writer, progress
 		}
 		return drainFifo(false)
 	}
+	// Decoders can change sample rate or layout mid-stream (HE-AAC switches
+	// once SBR is detected a few frames after a seek), so the graph is
+	// rebuilt whenever the frame properties differ from what it was built for.
+	type audioProps struct {
+		rate   int
+		format astiav.SampleFormat
+		layout string
+	}
+	var agraphProps audioProps
 	onAudio := func(f *astiav.Frame) error {
+		props := audioProps{f.SampleRate(), f.SampleFormat(), f.ChannelLayout().String()}
+		nAudioIn++
+		if debug && nAudioIn <= 12 {
+			fmt.Fprintf(logw, "audio in #%d: pts=%d rate=%d fmt=%s layout=%s samples=%d (trim %d..%d tb %d/%d)\n",
+				nAudioIn, f.Pts(), props.rate, props.format.Name(), props.layout, f.NbSamples(),
+				tb(r.Start, as.TimeBase()), tb(end, as.TimeBase()), as.TimeBase().Num(), as.TimeBase().Den())
+		}
+		if agraph != nil && props != agraphProps {
+			if err := agraph.push(nil, onAudioOut); err != nil && !errors.Is(err, errGraphDone) {
+				return err
+			}
+			agraph.close()
+			agraph = nil
+		}
 		if agraph == nil {
-			aStart, aEnd := tb(r.Start, as.TimeBase()), tb(end, as.TimeBase())
-			spec := fmt.Sprintf("atrim=start_pts=%d:end_pts=%d,asetpts=PTS-STARTPTS,aformat=sample_fmts=%s:channel_layouts=stereo:sample_rates=%d",
-				aStart, aEnd, aenc.cc.SampleFormat().Name(), aenc.cc.SampleRate())
+			agraphProps = props
+			// atrim's start_pts/end_pts are in samples (unlike trim's), so
+			// give it seconds.
+			spec := fmt.Sprintf("atrim=start=%.6f:end=%.6f,asetpts=PTS-STARTPTS,aformat=sample_fmts=%s:channel_layouts=stereo:sample_rates=%d",
+				r.Start.Seconds(), end.Seconds(), aenc.cc.SampleFormat().Name(), aenc.cc.SampleRate())
 			var gerr error
 			agraph, gerr = newGraph(true, func(p *astiav.BuffersrcFilterContextParameters) {
 				p.SetChannelLayout(f.ChannelLayout())
@@ -872,6 +939,9 @@ func (Engine) Run(ctx context.Context, r *clip.Request, logw io.Writer, progress
 		}
 		if err := agraph.push(f, onAudioOut); err != nil {
 			if errors.Is(err, errGraphDone) {
+				if debug {
+					fmt.Fprintf(logw, "audio graph done after %d in / %d out\n", nAudioIn, nAudioOut)
+				}
 				audioDone = true
 				return nil
 			}
@@ -949,7 +1019,8 @@ func (Engine) Run(ctx context.Context, r *clip.Request, logw io.Writer, progress
 		progress(r.Duration, r.Duration)
 	}
 	if src.cache != nil && logw != nil {
-		fmt.Fprintf(logw, "fetched %.1f MB from the server in %d requests\n", float64(src.cache.Bytes)/1e6, src.cache.Fetches)
+		fetches, bytes := src.cache.Stats()
+		fmt.Fprintf(logw, "fetched %.1f MB from the server in %d requests\n", float64(bytes)/1e6, fetches)
 	}
 	return nil
 }

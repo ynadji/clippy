@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -63,6 +64,19 @@ func probe(t *testing.T, file string) (dur float64, streams string) {
 	return dur, s
 }
 
+// meanVolume returns the mean audio level in dB via the ffmpeg binary.
+func meanVolume(t *testing.T, file string) float64 {
+	t.Helper()
+	out, _ := exec.Command("ffmpeg", "-hide_banner", "-i", file, "-map", "0:a:0", "-af", "volumedetect", "-f", "null", "-").CombinedOutput()
+	for _, line := range strings.Split(string(out), "\n") {
+		if i := strings.Index(line, "mean_volume:"); i >= 0 {
+			f, _ := strconv.ParseFloat(strings.TrimSpace(strings.TrimSuffix(line[i+len("mean_volume:"):], " dB")), 64)
+			return f
+		}
+	}
+	return -999
+}
+
 func TestEngineLocal(t *testing.T) {
 	in := fixture(t)
 	dir := t.TempDir()
@@ -90,6 +104,9 @@ func TestEngineLocal(t *testing.T) {
 	}
 	if last < 3900*time.Millisecond {
 		t.Errorf("progress ended at %v", last)
+	}
+	if v := meanVolume(t, r.Output); v < -40 {
+		t.Errorf("audio is silent (mean %.1f dB); the 440 Hz tone should be there", v)
 	}
 	if keep := os.Getenv("CLIPPY_KEEP"); keep != "" {
 		exec.Command("cp", r.Output, keep).Run()
@@ -119,6 +136,9 @@ func TestEngineRemote(t *testing.T) {
 	if dur, _ := probe(t, r.Output); dur < 2.9 || dur > 3.2 {
 		t.Errorf("duration = %v, want ~3s", dur)
 	}
+	if v := meanVolume(t, r.Output); v < -40 {
+		t.Errorf("audio is silent (mean %.1f dB)", v)
+	}
 }
 
 func TestThumbnail(t *testing.T) {
@@ -134,4 +154,57 @@ func TestThumbnail(t *testing.T) {
 		os.WriteFile(keep+".jpg", jpeg, 0o644)
 	}
 	t.Logf("thumbnail: %d bytes", len(jpeg))
+}
+
+// Two thumbnails and a clip on the same remote file should share one block
+// cache: the upstream sees the file fetched once, not three times.
+func TestSharedCache(t *testing.T) {
+	in := fixture(t)
+	dir := t.TempDir()
+	var served int64
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		cw := &countingWriter{ResponseWriter: w}
+		http.ServeFile(cw, req, in)
+		mu.Lock()
+		served += cw.n
+		mu.Unlock()
+	}))
+	defer srv.Close()
+	url, hdr := srv.URL+"/library/parts/9/9/file.mkv", "X-Plex-Token: t\r\n"
+	st, _ := os.Stat(in)
+
+	var wg sync.WaitGroup
+	for _, at := range []time.Duration{5 * time.Second, 8 * time.Second} {
+		wg.Add(1)
+		go func(at time.Duration) {
+			defer wg.Done()
+			if _, err := Thumbnail(context.Background(), url, hdr, at, 320, "auto"); err != nil {
+				t.Error(err)
+			}
+		}(at)
+	}
+	wg.Wait()
+	r := clip.Request{Input: url, Headers: hdr, Output: filepath.Join(dir, "c.mp4"), Start: 5 * time.Second, Duration: 3 * time.Second, AudioIndex: -1}
+	if err := (Engine{}).Run(context.Background(), &r, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// The fixture is smaller than one block, so a shared cache fetches it
+	// about once (plus the 1-byte size probe). Separate caches would be 3x.
+	if served > st.Size()+st.Size()/2 {
+		t.Errorf("upstream served %d bytes for a %d byte file; cache is not shared", served, st.Size())
+	}
+}
+
+type countingWriter struct {
+	http.ResponseWriter
+	n int64
+}
+
+func (c *countingWriter) Write(b []byte) (int, error) {
+	n, err := c.ResponseWriter.Write(b)
+	c.n += int64(n)
+	return n, err
 }
