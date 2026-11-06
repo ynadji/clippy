@@ -10,6 +10,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -118,7 +121,50 @@ type Session struct {
 	AudioIndex  int // selected audio stream (absolute index), -1 if unknown
 	SubIndex    int // selected subtitle stream (absolute index), -1 if none
 	SubCodec    string
-	SubExternal bool // selected subtitle is a sidecar file, not embedded
+	SubExternal bool   // selected subtitle is a sidecar file, not embedded
+	AudioLang   string // language code of the selected audio stream, if known
+
+	subs []*Subtitle
+}
+
+// Subtitle is one subtitle track of an item.
+type Subtitle struct {
+	Index    int    // absolute stream index for embedded tracks, -1 for sidecar files
+	Key      string // server path of a sidecar subtitle file, empty for embedded tracks
+	Codec    string
+	Title    string // display title, such as "English (ASS)"
+	Lang     string // language code, such as "eng"
+	External bool
+	Forced   bool
+	Selected bool // Plex has this track selected for the account
+	Burnable bool // text-based, so it can be rendered into the picture
+}
+
+// SubtitleList is a gomobile-friendly slice of subtitle tracks.
+type SubtitleList struct{ items []*Subtitle }
+
+func (l *SubtitleList) Len() int            { return len(l.items) }
+func (l *SubtitleList) Get(i int) *Subtitle { return l.items[i] }
+
+// Subtitles lists the item's subtitle tracks.
+func (s *Session) Subtitles() *SubtitleList { return &SubtitleList{items: s.subs} }
+
+func subtitleFrom(st *plex.Stream) *Subtitle {
+	sub := &Subtitle{
+		Index: int(st.Index), Key: st.Key, Codec: st.Codec, Title: st.DisplayTitle,
+		Lang: st.LanguageCode, External: st.Key != "", Forced: bool(st.Forced),
+		Selected: bool(st.Selected), Burnable: clip.TextSubtitle(st.Codec),
+	}
+	if sub.External {
+		sub.Index = -1
+	}
+	if sub.Title == "" {
+		sub.Title = st.Language
+	}
+	if sub.Title == "" {
+		sub.Title = st.Codec
+	}
+	return sub
 }
 
 // SessionList is a gomobile-friendly slice of sessions.
@@ -147,12 +193,44 @@ func sessionFrom(ctx context.Context, cl *plex.Client, it *plex.Item) *Session {
 		}
 		if a := p.SelectedStream(plex.StreamAudio); a != nil {
 			s.AudioIndex = int(a.Index)
+			s.AudioLang = a.LanguageCode
 		}
 		if sub := p.SelectedStream(plex.StreamSubtitle); sub != nil {
 			s.SubIndex, s.SubCodec, s.SubExternal = int(sub.Index), sub.Codec, sub.Key != ""
 		}
+		streams := p.Streams(plex.StreamSubtitle)
+		// A session lists only some streams and some players (Plex for iOS)
+		// do not mark the subtitle selection there. The library metadata has
+		// every track, with the account's selection.
+		if it.Player != nil {
+			if full, err := cl.Metadata(ctx, it.RatingKey); err == nil {
+				if fp := partByKey(full, p.Key); fp != nil {
+					streams = fp.Streams(plex.StreamSubtitle)
+				}
+			}
+		}
+		sessionSelected := s.SubIndex
+		for i := range streams {
+			sub := subtitleFrom(&streams[i])
+			if sessionSelected >= 0 && !sub.External {
+				sub.Selected = sub.Index == sessionSelected // the player's choice wins when it reports one
+			}
+			s.subs = append(s.subs, sub)
+		}
 	}
 	return s
+}
+
+// partByKey finds the part with the given key, or the selected part.
+func partByKey(it *plex.Item, key string) *plex.Part {
+	for i := range it.Media {
+		for j := range it.Media[i].Part {
+			if it.Media[i].Part[j].Key == key {
+				return &it.Media[i].Part[j]
+			}
+		}
+	}
+	return it.SelectedPart()
 }
 
 // NowPlaying lists the video sessions on the server with live positions.
@@ -211,6 +289,7 @@ type ClipRequest struct {
 	MaxHeight  int    // 0 keeps the source height
 	AudioIndex int    // absolute stream index, -1 for default
 	SubIndex   int    // absolute subtitle stream index to burn in, -1 for none
+	SubKey     string // server path of a sidecar subtitle file to burn in instead
 }
 
 // ProgressListener receives clip progress on a background goroutine.
@@ -247,17 +326,45 @@ func StartClip(req *ClipRequest, listener ProgressListener) (*ClipJob, error) {
 		AudioIndex: req.AudioIndex,
 		HWAccel:    "auto",
 	}
-	if req.SubIndex >= 0 {
+	var subDir string
+	switch {
+	case req.SubKey != "":
+		// Sidecar file: fetch it next to the output, burn it in, remove it.
+		dir, err := os.MkdirTemp("", "bananaclip-sub-")
+		if err != nil {
+			return nil, err
+		}
+		subDir = dir
+		ext := filepath.Ext(strings.SplitN(req.SubKey, "?", 2)[0])
+		if ext == "" || len(ext) > 5 {
+			ext = ".srt"
+		}
+		file := filepath.Join(dir, "subs"+ext)
+		dctx, dcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err = plex.New(req.ServerURL, req.Token, "").Download(dctx, req.SubKey, file)
+		dcancel()
+		if err != nil {
+			os.RemoveAll(dir)
+			return nil, fmt.Errorf("download subtitles: %w", err)
+		}
+		r.Subtitle = &clip.Subtitle{File: file, Index: -1}
+	case req.SubIndex >= 0:
 		r.Subtitle = &clip.Subtitle{Index: req.SubIndex}
 	}
 	var eng libav.Engine
 	if err := eng.Preflight(r); err != nil {
+		if subDir != "" {
+			os.RemoveAll(subDir)
+		}
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	job := &ClipJob{cancel: cancel}
 	go func() {
 		defer cancel()
+		if subDir != "" {
+			defer os.RemoveAll(subDir)
+		}
 		err := eng.Run(ctx, r, nil, func(done, total time.Duration) {
 			listener.OnProgress(done.Milliseconds(), total.Milliseconds())
 		})
