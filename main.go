@@ -355,7 +355,7 @@ func cmdClip(ctx context.Context, args []string) error {
 	}
 	if f.audioStream >= 0 {
 		req.AudioIndex = f.audioStream
-	} else if s := part.SelectedStream(plex.StreamAudio); s != nil && s.Index >= 0 {
+	} else if s := part.ActiveStream(plex.StreamAudio); s != nil && s.Index >= 0 {
 		req.AudioIndex = int(s.Index)
 	}
 	if f.subs || f.subStream >= 0 {

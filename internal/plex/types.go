@@ -200,6 +200,26 @@ func (p *Part) SelectedStream(typ int) *Stream {
 	return nil
 }
 
+// ActiveStream returns the stream of the given type that is in use: the one
+// marked selected, or failing that the only one listed. Sessions from some
+// players (Plex for iOS) list just the audio track being played, without
+// marking it.
+func (p *Part) ActiveStream(typ int) *Stream {
+	if s := p.SelectedStream(typ); s != nil {
+		return s
+	}
+	var only *Stream
+	for i := range p.Stream {
+		if int(p.Stream[i].StreamType) == typ {
+			if only != nil {
+				return nil
+			}
+			only = &p.Stream[i]
+		}
+	}
+	return only
+}
+
 // Describe returns a short label for a stream.
 func (s *Stream) Describe() string {
 	parts := []string{}

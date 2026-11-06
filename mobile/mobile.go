@@ -216,7 +216,13 @@ func sessionFrom(ctx context.Context, cl *plex.Client, it *plex.Item) *Session {
 				s.VideoClass = classFromLabel(media.VideoResolution)
 			}
 		}
-		if a := p.SelectedStream(plex.StreamAudio); a != nil {
+		// The audio track being played: what the session says, else the
+		// account's selection in the library.
+		a := p.ActiveStream(plex.StreamAudio)
+		if a == nil && fullPart != nil {
+			a = fullPart.SelectedStream(plex.StreamAudio)
+		}
+		if a != nil {
 			s.AudioIndex = int(a.Index)
 			s.AudioLang = a.LanguageCode
 		}

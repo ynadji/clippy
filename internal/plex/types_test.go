@@ -36,3 +36,21 @@ func TestFlexibleNumbers(t *testing.T) {
 		t.Errorf("subs = %+v", subs)
 	}
 }
+
+func TestActiveStream(t *testing.T) {
+	// Plex for iOS: one audio stream listed, not marked selected.
+	p := Part{Stream: []Stream{{StreamType: 1, Index: 0}, {StreamType: 2, Index: 2}, {StreamType: 3, Index: 3}}}
+	if a := p.ActiveStream(StreamAudio); a == nil || a.Index != 2 {
+		t.Errorf("sole unmarked audio stream should be active, got %+v", a)
+	}
+	// A marked stream wins over position.
+	p = Part{Stream: []Stream{{StreamType: 2, Index: 1}, {StreamType: 2, Index: 2, Selected: true}}}
+	if a := p.ActiveStream(StreamAudio); a == nil || a.Index != 2 {
+		t.Errorf("selected stream should be active, got %+v", a)
+	}
+	// Several unmarked streams: unknown.
+	p = Part{Stream: []Stream{{StreamType: 2, Index: 1}, {StreamType: 2, Index: 2}}}
+	if a := p.ActiveStream(StreamAudio); a != nil {
+		t.Errorf("ambiguous streams should give nil, got %+v", a)
+	}
+}
