@@ -20,7 +20,7 @@ func Thumbnail(ctx context.Context, input, headers string, t time.Duration, maxW
 		return nil, err
 	}
 	defer src.close()
-	vs, _, err := pickStreams(src.fc, -1)
+	vs, _, err := pickStreams(src.fc, -1, 0)
 	if err != nil {
 		return nil, err
 	}

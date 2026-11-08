@@ -22,6 +22,10 @@ from, fetching the file from Plex in 4 MB ranges, so only the part of the file
 around the clip is transferred and ffmpeg's constant seeking never leaves the
 machine. clippy can run anywhere, not just on the Plex host.
 
+The Go packages also speak Jellyfin (and Emby, same API): `internal/jellyfin`
+and the `mobile` package used by the Banana Clip iPhone app. The command line
+tool itself is Plex-only for now.
+
 ## Install
 
 ```

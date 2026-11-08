@@ -83,10 +83,10 @@ func (e Engine) Describe(r *clip.Request) ([]string, error) {
 		fmt.Sprintf("range:    %s for %s", clip.Clock(r.Start), r.Duration),
 		fmt.Sprintf("decode:   hwaccel=%s", hwaccelName(r)),
 		fmt.Sprintf("video:    %s, max height %d", venc.Name(), r.MaxHeight),
-		fmt.Sprintf("audio:    %s stereo 160k, stream %d", aenc.Name(), r.AudioIndex),
+		fmt.Sprintf("audio:    %s stereo 160k, %s", aenc.Name(), audioPick(r)),
 	}
 	if r.Subtitle != nil {
-		lines = append(lines, fmt.Sprintf("subtitle: burn in stream %d (%s)", r.Subtitle.Index, r.Subtitle.Codec))
+		lines = append(lines, fmt.Sprintf("subtitle: burn in %s (%s)", subtitlePick(r.Subtitle), r.Subtitle.Codec))
 	}
 	lines = append(lines, fmt.Sprintf("output:   %s", r.Output))
 	return lines, nil
@@ -269,12 +269,29 @@ func secondsOf(ts int64, r astiav.Rational) time.Duration {
 	return time.Duration(float64(ts) * float64(r.Num()) / float64(r.Den()) * float64(time.Second))
 }
 
-func pickStreams(fc *astiav.FormatContext, audioIndex int) (vs, as *astiav.Stream, err error) {
+// nthStream returns the nth (1-based) stream of a type, or nil.
+func nthStream(fc *astiav.FormatContext, typ astiav.MediaType, n int) *astiav.Stream {
+	for _, s := range fc.Streams() {
+		if s.CodecParameters().MediaType() == typ {
+			n--
+			if n == 0 {
+				return s
+			}
+		}
+	}
+	return nil
+}
+
+func pickStreams(fc *astiav.FormatContext, audioIndex, audioNth int) (vs, as *astiav.Stream, err error) {
 	vs, _, err = fc.FindBestStream(astiav.MediaTypeVideo, -1, -1)
 	if err != nil || vs == nil {
 		return nil, nil, errors.New("libav: no video stream")
 	}
-	if audioIndex >= 0 {
+	if audioNth > 0 {
+		if as = nthStream(fc, astiav.MediaTypeAudio, audioNth); as == nil {
+			return nil, nil, fmt.Errorf("libav: no audio stream #%d", audioNth)
+		}
+	} else if audioIndex >= 0 {
 		for _, s := range fc.Streams() {
 			if s.Index() == audioIndex && s.CodecParameters().MediaType() == astiav.MediaTypeAudio {
 				as = s
@@ -704,7 +721,7 @@ func (Engine) Run(ctx context.Context, r *clip.Request, logw io.Writer, progress
 		return err
 	}
 	defer src.close()
-	vs, as, err := pickStreams(src.fc, r.AudioIndex)
+	vs, as, err := pickStreams(src.fc, r.AudioIndex, r.AudioNth)
 	if err != nil {
 		return err
 	}
@@ -1073,6 +1090,10 @@ func extractSubtitles(ctx context.Context, src *source, r *clip.Request, dir str
 				break
 			}
 		}
+	} else if r.Subtitle.Nth > 0 {
+		if st = nthStream(src.fc, astiav.MediaTypeSubtitle, r.Subtitle.Nth); st == nil {
+			return "", fmt.Errorf("libav: no subtitle stream #%d", r.Subtitle.Nth)
+		}
 	} else {
 		for _, s := range src.fc.Streams() {
 			if s.Index() == r.Subtitle.Index && s.CodecParameters().MediaType() == astiav.MediaTypeSubtitle {
@@ -1125,11 +1146,17 @@ func extractSubtitles(ctx context.Context, src *source, r *clip.Request, dir str
 		}
 	}
 	start, end := tb(r.Start, st.TimeBase()), tb(r.Start+r.Duration, st.TimeBase())
-	if err := remuxSubtitles(ctx, in, st, ost, out, start, end); err != nil {
+	n, err := remuxSubtitles(ctx, in, st, ost, out, start, end)
+	if err != nil {
 		return "", err
 	}
 	if err := out.WriteTrailer(); err != nil {
 		return "", err
+	}
+	if n == 0 {
+		// Nothing is said in this window. libass rejects a cue-less file,
+		// and there is nothing to burn in anyway.
+		return "", nil
 	}
 	return path, nil
 }
@@ -1137,18 +1164,21 @@ func extractSubtitles(ctx context.Context, src *source, r *clip.Request, dir str
 // remuxSubtitles copies the cues of st that overlap [start, end) (in st's
 // time base) into ost, shifted so that start becomes zero and clamped to
 // the range.
-func remuxSubtitles(ctx context.Context, in *source, st, ost *astiav.Stream, out *astiav.FormatContext, start, end int64) error {
+// remuxSubtitles copies the cues overlapping [start, end) to out and
+// returns how many it wrote.
+func remuxSubtitles(ctx context.Context, in *source, st, ost *astiav.Stream, out *astiav.FormatContext, start, end int64) (int, error) {
 	pkt := astiav.AllocPacket()
 	defer pkt.Free()
+	n := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return n, err
 		}
 		if err := in.fc.ReadFrame(pkt); err != nil {
 			if errors.Is(err, astiav.ErrEof) {
-				return nil
+				return n, nil
 			}
-			return err
+			return n, err
 		}
 		if pkt.StreamIndex() != st.Index() {
 			pkt.Unref()
@@ -1157,7 +1187,7 @@ func remuxSubtitles(ctx context.Context, in *source, st, ost *astiav.Stream, out
 		pts, dur := pkt.Pts(), pkt.Duration()
 		if pts >= end {
 			pkt.Unref()
-			return nil
+			return n, nil
 		}
 		if pts+dur <= start {
 			pkt.Unref()
@@ -1179,7 +1209,28 @@ func remuxSubtitles(ctx context.Context, in *source, st, ost *astiav.Stream, out
 		err := out.WriteInterleavedFrame(pkt)
 		pkt.Unref()
 		if err != nil {
-			return fmt.Errorf("libav: write subtitle: %w", err)
+			return n, fmt.Errorf("libav: write subtitle: %w", err)
 		}
+		n++
 	}
+}
+
+func audioPick(r *clip.Request) string {
+	switch {
+	case r.AudioNth > 0:
+		return fmt.Sprintf("audio stream #%d", r.AudioNth)
+	case r.AudioIndex >= 0:
+		return fmt.Sprintf("stream %d", r.AudioIndex)
+	}
+	return "first audio stream"
+}
+
+func subtitlePick(s *clip.Subtitle) string {
+	switch {
+	case s.File != "":
+		return "file " + s.File
+	case s.Nth > 0:
+		return fmt.Sprintf("subtitle stream #%d", s.Nth)
+	}
+	return fmt.Sprintf("stream %d", s.Index)
 }

@@ -15,12 +15,14 @@ import (
 )
 
 // Subtitle describes a subtitle source to burn into the clip. Exactly one of
-// Index (an absolute stream index in the input file) or File (an external
-// subtitle file) is used.
+// Nth (position among the input's subtitle streams), Index (an absolute
+// stream index in the input file) or File (an external subtitle file) is
+// used, in that order of preference.
 type Subtitle struct {
+	Nth   int    // 1-based position among subtitle streams; 0 to use Index
 	Index int    // absolute stream index; ignored when File is set
 	File  string // external subtitle file
-	Codec string // as reported by Plex, for sanity checks
+	Codec string // as reported by the server, for sanity checks
 }
 
 // Request describes one clip.
@@ -35,6 +37,7 @@ type Request struct {
 	VideoCodec string    // source video codec, used for mp4 tagging in copy mode
 	AudioCodec string    // source audio codec, used in copy mode
 	AudioIndex int       // absolute audio stream index, or -1 for the first audio stream
+	AudioNth   int       // 1-based position among audio streams; used instead of AudioIndex when > 0
 	Subtitle   *Subtitle // nil for none
 	MaxHeight  int       // downscale to this height when re-encoding; 0 keeps source
 	CRF        int       // x264 quality when re-encoding (lower is better)
@@ -157,7 +160,11 @@ func (r *Request) Build() (*Plan, error) {
 			extract = append(extract, "-i", r.Subtitle.File, "-map", "0:0")
 		} else {
 			extract = append(extract, r.inputArgs()...)
-			extract = append(extract, "-map", fmt.Sprintf("0:%d", r.Subtitle.Index))
+			if r.Subtitle.Nth > 0 {
+				extract = append(extract, "-map", fmt.Sprintf("0:s:%d", r.Subtitle.Nth-1))
+			} else {
+				extract = append(extract, "-map", fmt.Sprintf("0:%d", r.Subtitle.Index))
+			}
 		}
 		extract = append(extract, "-c:s", "ass", rawFile)
 		plan.Steps = append(plan.Steps,
@@ -173,7 +180,9 @@ func (r *Request) Build() (*Plan, error) {
 	args = append(args, "-ss", ss, "-t", t)
 	args = append(args, r.inputArgs()...)
 	args = append(args, "-map", "0:v:0")
-	if r.AudioIndex >= 0 {
+	if r.AudioNth > 0 {
+		args = append(args, "-map", fmt.Sprintf("0:a:%d", r.AudioNth-1))
+	} else if r.AudioIndex >= 0 {
 		args = append(args, "-map", fmt.Sprintf("0:%d", r.AudioIndex))
 	} else {
 		args = append(args, "-map", "0:a:0?")

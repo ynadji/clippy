@@ -3,7 +3,7 @@
 // Package mobile is the API the Banana Clip iOS app calls, built into an
 // xcframework with gomobile bind. It is a thin, gomobile-friendly layer
 // (basic types, []byte, pointers to structs, listener interfaces) over the
-// Plex client and the libav clip engine.
+// Plex and Jellyfin clients and the libav clip engine.
 package mobile
 
 import (
@@ -55,13 +55,73 @@ func WaitForPIN(clientID string, id int, timeoutSeconds int) (string, error) {
 	return plex.WaitForPIN(ctx, clientID, &plex.PIN{ID: id})
 }
 
-// Server is a Plex Media Server the account can reach.
+// Server kinds.
+const (
+	KindPlex     = "plex"
+	KindJellyfin = "jellyfin" // also Emby, whose API is the same
+)
+
+// Server is a media server the user can reach, with what is needed to talk
+// to it. The app persists it and passes it back to every call.
 type Server struct {
-	Name  string
-	URL   string // best reachable connection, empty if none answered
-	Token string // token to use with this server
-	Owned bool
-	Local bool
+	Kind     string // KindPlex or KindJellyfin; empty means Plex
+	Name     string
+	URL      string // best reachable connection, empty if none answered
+	Token    string // token to use with this server
+	UserID   string // Jellyfin user id; empty for Plex
+	ClientID string // this installation's id, sent with every request
+	Owned    bool
+	Local    bool
+}
+
+// backend is what the two server kinds have in common, as far as the app
+// needs: listing what is playing, describing an item, and fetching files.
+type backend interface {
+	nowPlaying(ctx context.Context) ([]*Session, error)
+	item(ctx context.Context, key string) (*Session, error)
+	// headers is the header block ffmpeg/libav sends with media requests.
+	headers() string
+	download(ctx context.Context, path, dest string) error
+}
+
+func backendFor(s *Server) (backend, error) {
+	if s == nil || s.URL == "" {
+		return nil, errors.New("no server")
+	}
+	switch s.Kind {
+	case "", KindPlex:
+		return plexBackend{plex.New(s.URL, s.Token, s.ClientID)}, nil
+	case KindJellyfin:
+		return jellyfinBackend{newJellyfin(s.URL, s.Token, s.UserID, s.ClientID)}, nil
+	}
+	return nil, fmt.Errorf("unknown server kind %q", s.Kind)
+}
+
+type plexBackend struct{ cl *plex.Client }
+
+func (b plexBackend) headers() string { return b.cl.FFmpegHeaders() }
+func (b plexBackend) download(ctx context.Context, path, dest string) error {
+	return b.cl.Download(ctx, path, dest)
+}
+func (b plexBackend) nowPlaying(ctx context.Context) ([]*Session, error) {
+	items, err := b.cl.Sessions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []*Session
+	for i := range items {
+		if items[i].IsVideo() {
+			out = append(out, sessionFrom(ctx, b.cl, &items[i]))
+		}
+	}
+	return out, nil
+}
+func (b plexBackend) item(ctx context.Context, key string) (*Session, error) {
+	it, err := b.cl.Metadata(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	return sessionFrom(ctx, b.cl, it), nil
 }
 
 // ServerList is a gomobile-friendly slice of servers.
@@ -86,7 +146,7 @@ func DiscoverServers(clientID, token string) (*ServerList, error) {
 		if s.AccessToken != "" {
 			tok = s.AccessToken
 		}
-		srv := &Server{Name: s.Name, Token: tok, Owned: s.Owned}
+		srv := &Server{Kind: KindPlex, Name: s.Name, Token: tok, ClientID: clientID, Owned: s.Owned}
 		if uri, err := plex.Reachable(ctx, s, tok, clientID); err == nil {
 			srv.URL = uri
 			for _, c := range s.Connections {
@@ -122,8 +182,8 @@ type Session struct {
 	VideoWidth  int // source picture size, 0 if unknown
 	VideoHeight int
 	VideoClass  int // resolution tier of the source: 480, 720, 1080, 2160, ...; 0 if unknown
-	AudioIndex  int // selected audio stream (absolute index), -1 if unknown
-	SubIndex    int // selected subtitle stream (absolute index), -1 if none
+	AudioIndex  int // selector of the audio track being played, -1 if unknown; pass back as ClipRequest.AudioIndex
+	SubIndex    int // selector of the selected embedded subtitle track, -1 if none; pass back as ClipRequest.SubIndex
 	SubCodec    string
 	SubExternal bool   // selected subtitle is a sidecar file, not embedded
 	AudioLang   string // language code of the selected audio stream, if known
@@ -132,8 +192,12 @@ type Session struct {
 }
 
 // Subtitle is one subtitle track of an item.
+//
+// Index selects an embedded track for ClipRequest.SubIndex. It is an
+// absolute stream index for Plex and the track's position among the file's
+// subtitle streams for Jellyfin; the app passes it back as is.
 type Subtitle struct {
-	Index    int    // absolute stream index for embedded tracks, -1 for sidecar files
+	Index    int    // selector for embedded tracks, -1 for sidecar files
 	Key      string // server path of a sidecar subtitle file, empty for embedded tracks
 	Codec    string
 	Title    string // display title, such as "English (ASS)"
@@ -257,34 +321,34 @@ func classFromLabel(label string) int {
 }
 
 // NowPlaying lists the video sessions on the server with live positions.
-func NowPlaying(serverURL, token, clientID string) (*SessionList, error) {
+func NowPlaying(server *Server) (*SessionList, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	cl := plex.New(serverURL, token, clientID)
-	items, err := cl.Sessions(ctx)
+	b, err := backendFor(server)
 	if err != nil {
 		return nil, err
 	}
-	out := &SessionList{}
-	for i := range items {
-		if items[i].IsVideo() {
-			out.items = append(out.items, sessionFrom(ctx, cl, &items[i]))
-		}
+	items, err := b.nowPlaying(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	return &SessionList{items: items}, nil
 }
 
-// Item fetches a library item by rating key as a Session with no player
-// information, for clipping things that are not currently playing.
-func Item(serverURL, token, clientID, ratingKey string) (*Session, error) {
+// Item fetches a library item by key (Plex rating key or Jellyfin item id)
+// as a Session with no player information, for clipping things that are
+// not currently playing.
+func Item(server *Server, key string) (*Session, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	cl := plex.New(serverURL, token, clientID)
-	it, err := cl.Metadata(ctx, ratingKey)
+	b, err := backendFor(server)
 	if err != nil {
 		return nil, err
 	}
-	s := sessionFrom(ctx, cl, it)
+	s, err := b.item(ctx, key)
+	if err != nil {
+		return nil, err
+	}
 	s.PositionMs, s.PositionVia = -1, ""
 	return s, nil
 }
@@ -292,26 +356,27 @@ func Item(serverURL, token, clientID, ratingKey string) (*Session, error) {
 // ---------------------------------------------------------------------------
 // Frames and clips
 
-func headersFor(token string) string { return "X-Plex-Token: " + token + "\r\n" }
-
 // Frame returns a JPEG of the video at atMs, no wider than maxWidth.
-func Frame(serverURL, token, partKey string, atMs int64, maxWidth int) ([]byte, error) {
+func Frame(server *Server, partKey string, atMs int64, maxWidth int) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	return libav.Thumbnail(ctx, serverURL+partKey, headersFor(token), time.Duration(atMs)*time.Millisecond, maxWidth, "auto")
+	b, err := backendFor(server)
+	if err != nil {
+		return nil, err
+	}
+	return libav.Thumbnail(ctx, server.URL+partKey, b.headers(), time.Duration(atMs)*time.Millisecond, maxWidth, "auto")
 }
 
 // ClipRequest describes a clip to produce.
 type ClipRequest struct {
-	ServerURL  string
-	Token      string
+	Server     *Server
 	PartKey    string
 	StartMs    int64
 	DurationMs int64
 	Output     string // destination .mp4 path
 	MaxHeight  int    // 0 keeps the source height
-	AudioIndex int    // absolute stream index, -1 for default
-	SubIndex   int    // absolute subtitle stream index to burn in, -1 for none
+	AudioIndex int    // Session.AudioIndex, -1 for the default track
+	SubIndex   int    // Subtitle.Index of an embedded track to burn in, -1 for none
 	SubKey     string // server path of a sidecar subtitle file to burn in instead
 }
 
@@ -339,15 +404,27 @@ func StartClip(req *ClipRequest, listener ProgressListener) (*ClipJob, error) {
 	if req.DurationMs <= 0 {
 		return nil, errors.New("duration must be positive")
 	}
+	b, err := backendFor(req.Server)
+	if err != nil {
+		return nil, err
+	}
 	r := &clip.Request{
-		Input:      req.ServerURL + req.PartKey,
-		Headers:    headersFor(req.Token),
+		Input:      req.Server.URL + req.PartKey,
+		Headers:    b.headers(),
 		Start:      time.Duration(req.StartMs) * time.Millisecond,
 		Duration:   time.Duration(req.DurationMs) * time.Millisecond,
 		Output:     req.Output,
 		MaxHeight:  req.MaxHeight,
-		AudioIndex: req.AudioIndex,
+		AudioIndex: -1,
 		HWAccel:    "auto",
+	}
+	// Plex reports absolute stream indexes; Jellyfin's are renumbered, so
+	// its sessions carry positions among streams of a type instead.
+	byPosition := req.Server.Kind == KindJellyfin
+	if byPosition && req.AudioIndex > 0 {
+		r.AudioNth = req.AudioIndex
+	} else if !byPosition {
+		r.AudioIndex = req.AudioIndex
 	}
 	var subDir string
 	switch {
@@ -364,14 +441,16 @@ func StartClip(req *ClipRequest, listener ProgressListener) (*ClipJob, error) {
 		}
 		file := filepath.Join(dir, "subs"+ext)
 		dctx, dcancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err = plex.New(req.ServerURL, req.Token, "").Download(dctx, req.SubKey, file)
+		err = b.download(dctx, req.SubKey, file)
 		dcancel()
 		if err != nil {
 			os.RemoveAll(dir)
 			return nil, fmt.Errorf("download subtitles: %w", err)
 		}
 		r.Subtitle = &clip.Subtitle{File: file, Index: -1}
-	case req.SubIndex >= 0:
+	case byPosition && req.SubIndex > 0:
+		r.Subtitle = &clip.Subtitle{Nth: req.SubIndex}
+	case !byPosition && req.SubIndex >= 0:
 		r.Subtitle = &clip.Subtitle{Index: req.SubIndex}
 	}
 	var eng libav.Engine

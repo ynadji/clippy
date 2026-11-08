@@ -1,7 +1,7 @@
 package plex
 
 import (
-	"fmt"
+	"github.com/ynadji/clippy/internal/names"
 	"strings"
 	"time"
 )
@@ -104,44 +104,18 @@ func (it *Item) IsVideo() bool { return it.Type == "movie" || it.Type == "episod
 // Label is a human-readable name like "Show S01E02 – Title" or "Title (2020)".
 func (it *Item) Label() string {
 	if it.Type == "episode" {
-		return fmt.Sprintf("%s S%02dE%02d – %s", it.GrandparentTitle, it.ParentIndex, it.Index, it.Title)
+		return names.Episode(it.GrandparentTitle, int(it.ParentIndex), int(it.Index), it.Title)
 	}
-	if it.Year > 0 {
-		return fmt.Sprintf("%s (%d)", it.Title, it.Year)
-	}
-	return it.Title
+	return names.Movie(it.Title, int(it.Year))
 }
 
 // FileStem is a filesystem-safe base name for clips of this item, such as
 // "Show_S02E01_Episode_Title" or "Movie_Title".
 func (it *Item) FileStem() string {
-	var s string
 	if it.Type == "episode" {
-		s = fmt.Sprintf("%s S%02dE%02d %s", it.GrandparentTitle, it.ParentIndex, it.Index, it.Title)
-	} else {
-		s = it.Title
+		return names.EpisodeStem(it.GrandparentTitle, int(it.ParentIndex), int(it.Index), it.Title)
 	}
-	return sanitize(s)
-}
-
-func sanitize(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '.':
-			b.WriteRune(r)
-		case r == ' ', r == '_', r == ';', r == ':', r == ',', r == '/':
-			b.WriteRune('_')
-		}
-	}
-	out := strings.Trim(b.String(), "_.")
-	for strings.Contains(out, "__") {
-		out = strings.ReplaceAll(out, "__", "_")
-	}
-	if out == "" {
-		out = "clip"
-	}
-	return out
+	return names.Sanitize(it.Title)
 }
 
 // Offset is the current playback position (sessions only).
